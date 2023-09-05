@@ -6,7 +6,6 @@ package proposervm
 import (
 	"context"
 	"crypto"
-	"crypto/x509"
 	"fmt"
 	"time"
 
@@ -27,9 +26,12 @@ import (
 	"github.com/ava-labs/avalanchego/snow/consensus/snowman"
 	"github.com/ava-labs/avalanchego/snow/engine/common"
 	"github.com/ava-labs/avalanchego/snow/engine/snowman/block"
+	"github.com/ava-labs/avalanchego/staking"
 	"github.com/ava-labs/avalanchego/utils"
+	"github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/avalanchego/utils/math"
 	"github.com/ava-labs/avalanchego/utils/timer/mockable"
+	"github.com/ava-labs/avalanchego/utils/units"
 	"github.com/ava-labs/avalanchego/vms/proposervm/indexer"
 	"github.com/ava-labs/avalanchego/vms/proposervm/proposer"
 	"github.com/ava-labs/avalanchego/vms/proposervm/scheduler"
@@ -45,23 +47,42 @@ const (
 	DefaultMinBlockDelay = time.Second
 
 	checkIndexedFrequency = 10 * time.Second
-	innerBlkCacheSize     = 512
+	innerBlkCacheSize     = 64 * units.MiB
 )
 
 var (
-	_ block.ChainVM              = (*VM)(nil)
-	_ block.BatchedChainVM       = (*VM)(nil)
-	_ block.HeightIndexedChainVM = (*VM)(nil)
-	_ block.StateSyncableVM      = (*VM)(nil)
+	_ block.ChainVM         = (*VM)(nil)
+	_ block.BatchedChainVM  = (*VM)(nil)
+	_ block.StateSyncableVM = (*VM)(nil)
+
+	// TODO: remove after the X-chain supports height indexing.
+	mainnetXChainID ids.ID
+	fujiXChainID    ids.ID
 
 	dbPrefix = []byte("proposervm")
 )
+
+func init() {
+	var err error
+	mainnetXChainID, err = ids.FromString("2oYMBNV4eNHyqk2fjjV5nVQLDbtmNJzq5s3qs3Lo6ftnC6FByM")
+	if err != nil {
+		panic(err)
+	}
+
+	fujiXChainID, err = ids.FromString("2JVSBoinj9C2J33VntvzYtVJNZdN2NKiwwKjcumHUWEb5DbBrm")
+	if err != nil {
+		panic(err)
+	}
+}
+
+func cachedBlockSize(_ ids.ID, blk snowman.Block) int {
+	return ids.IDLen + len(blk.Bytes()) + constants.PointerOverhead
+}
 
 type VM struct {
 	block.ChainVM
 	blockBuilderVM block.BuildBlockWithContextChainVM
 	batchedVM      block.BatchedChainVM
-	hVM            block.HeightIndexedChainVM
 	ssVM           block.StateSyncableVM
 
 	activationTime      time.Time
@@ -70,7 +91,7 @@ type VM struct {
 	// block signer
 	stakingLeafSigner crypto.Signer
 	// block certificate
-	stakingCertLeaf *x509.Certificate
+	stakingCertLeaf *staking.Certificate
 
 	state.State
 	hIndexer indexer.HeightIndexer
@@ -115,17 +136,15 @@ func New(
 	minimumPChainHeight uint64,
 	minBlkDelay time.Duration,
 	stakingLeafSigner crypto.Signer,
-	stakingCertLeaf *x509.Certificate,
+	stakingCertLeaf *staking.Certificate,
 ) *VM {
 	blockBuilderVM, _ := vm.(block.BuildBlockWithContextChainVM)
 	batchedVM, _ := vm.(block.BatchedChainVM)
-	hVM, _ := vm.(block.HeightIndexedChainVM)
 	ssVM, _ := vm.(block.StateSyncableVM)
 	return &VM{
 		ChainVM:        vm,
 		blockBuilderVM: blockBuilderVM,
 		batchedVM:      batchedVM,
-		hVM:            hVM,
 		ssVM:           ssVM,
 
 		activationTime:      activationTime,
@@ -168,13 +187,20 @@ func (vm *VM) Initialize(
 	rawDB := dbManager.Current().Database
 	prefixDB := prefixdb.New(dbPrefix, rawDB)
 	vm.db = versiondb.New(prefixDB)
-	vm.State = state.New(vm.db)
+	baseState, err := state.NewMetered(vm.db, "state", registerer)
+	if err != nil {
+		return err
+	}
+	vm.State = baseState
 	vm.Windower = proposer.New(chainCtx.ValidatorState, chainCtx.SubnetID, chainCtx.ChainID)
 	vm.Tree = tree.New()
 	innerBlkCache, err := metercacher.New[ids.ID, snowman.Block](
 		"inner_block_cache",
 		registerer,
-		&cache.LRU[ids.ID, snowman.Block]{Size: innerBlkCacheSize},
+		cache.NewSizedLRU[ids.ID, snowman.Block](
+			innerBlkCacheSize,
+			cachedBlockSize,
+		),
 	)
 	if err != nil {
 		return err
@@ -182,7 +208,6 @@ func (vm *VM) Initialize(
 	vm.innerBlkCache = innerBlkCache
 
 	indexerDB := versiondb.New(vm.db)
-	// TODO: Use [state.NewMetered] here to populate additional metrics.
 	indexerState := state.New(indexerDB)
 	vm.hIndexer = indexer.NewHeightIndexer(vm, vm.ctx.Log, indexerState)
 
@@ -219,12 +244,33 @@ func (vm *VM) Initialize(
 		return err
 	}
 
-	return vm.setLastAcceptedMetadata(ctx)
+	if err := vm.setLastAcceptedMetadata(ctx); err != nil {
+		return err
+	}
+
+	forkHeight, err := vm.getForkHeight()
+	switch err {
+	case nil:
+		chainCtx.Log.Info("initialized proposervm",
+			zap.String("state", "after fork"),
+			zap.Uint64("forkHeight", forkHeight),
+			zap.Uint64("lastAcceptedHeight", vm.lastAcceptedHeight),
+		)
+	case database.ErrNotFound:
+		chainCtx.Log.Info("initialized proposervm",
+			zap.String("state", "before fork"),
+		)
+	default:
+		return err
+	}
+	return nil
 }
 
 // shutdown ops then propagate shutdown to innerVM
 func (vm *VM) Shutdown(ctx context.Context) error {
 	vm.onShutdown()
+
+	vm.Scheduler.Close()
 
 	if err := vm.db.Commit(); err != nil {
 		return err
@@ -256,6 +302,11 @@ func (vm *VM) SetState(ctx context.Context, newState snow.State) error {
 func (vm *VM) BuildBlock(ctx context.Context) (snowman.Block, error) {
 	preferredBlock, err := vm.getBlock(ctx, vm.preferred)
 	if err != nil {
+		vm.ctx.Log.Error("unexpected build block failure",
+			zap.String("reason", "failed to fetch preferred block"),
+			zap.Stringer("parentID", vm.preferred),
+			zap.Error(err),
+		)
 		return nil, err
 	}
 
@@ -339,12 +390,7 @@ func (vm *VM) LastAccepted(ctx context.Context) (ids.ID, error) {
 // repair makes sure that vm and innerVM chains are in sync.
 // Moreover it fixes vm's height index if defined.
 func (vm *VM) repair(ctx context.Context) error {
-	if vm.hVM == nil {
-		// height index not defined. Just sync vms and innerVM chains.
-		return vm.repairAcceptedChainByIteration(ctx)
-	}
-
-	switch vm.hVM.VerifyHeightIndex(ctx) {
+	switch err := vm.ChainVM.VerifyHeightIndex(ctx); err {
 	case nil:
 		// InnerVM height index is complete. We can immediately verify
 		// and repair this VM height index.
@@ -359,7 +405,7 @@ func (vm *VM) repair(ctx context.Context) error {
 		}
 	case block.ErrIndexIncomplete:
 	default:
-		return nil
+		return err
 	}
 
 	// innerVM height index is incomplete. Sync vm and innerVM chains first.
@@ -376,7 +422,7 @@ func (vm *VM) repair(ctx context.Context) error {
 		for {
 			// The underlying VM expects the lock to be held here.
 			vm.ctx.Lock.Lock()
-			err := vm.hVM.VerifyHeightIndex(ctx)
+			err := vm.ChainVM.VerifyHeightIndex(ctx)
 			vm.ctx.Lock.Unlock()
 
 			if err == nil {
@@ -656,6 +702,26 @@ func (vm *VM) getBlock(ctx context.Context, id ids.ID) (Block, error) {
 	return vm.getPreForkBlock(ctx, id)
 }
 
+// TODO: remove after the P-chain and X-chain support height indexing.
+func (vm *VM) getForkHeight() (uint64, error) {
+	// The fork block can be easily identified with the provided links because
+	// the `Parent Hash` is equal to the `Proposer Parent ID`.
+	switch vm.ctx.ChainID {
+	case constants.PlatformChainID:
+		switch vm.ctx.NetworkID {
+		case constants.MainnetID:
+			return 805732, nil // https://subnets.avax.network/p-chain/block/805732
+		case constants.FujiID:
+			return 47529, nil // https://subnets-test.avax.network/p-chain/block/47529
+		}
+	case mainnetXChainID:
+		return 1, nil // https://subnets.avax.network/x-chain/block/1
+	case fujiXChainID:
+		return 1, nil // https://subnets-test.avax.network/x-chain/block/1
+	}
+	return vm.GetForkHeight()
+}
+
 func (vm *VM) getPostForkBlock(ctx context.Context, blkID ids.ID) (PostForkBlock, error) {
 	block, exists := vm.verifiedBlocks[blkID]
 	if exists {
@@ -701,12 +767,20 @@ func (vm *VM) getPreForkBlock(ctx context.Context, blkID ids.ID) (*preForkBlock,
 	}, err
 }
 
-func (vm *VM) storePostForkBlock(blk PostForkBlock) error {
-	if err := vm.State.PutBlock(blk.getStatelessBlk(), blk.Status()); err != nil {
-		return err
-	}
+func (vm *VM) acceptPostForkBlock(blk PostForkBlock) error {
 	height := blk.Height()
 	blkID := blk.ID()
+
+	vm.lastAcceptedHeight = height
+	delete(vm.verifiedBlocks, blkID)
+
+	// Persist this block, its height index, and its status
+	if err := vm.State.SetLastAccepted(blkID); err != nil {
+		return err
+	}
+	if err := vm.State.PutBlock(blk.getStatelessBlk(), choices.Accepted); err != nil {
+		return err
+	}
 	if err := vm.updateHeightIndex(height, blkID); err != nil {
 		return err
 	}

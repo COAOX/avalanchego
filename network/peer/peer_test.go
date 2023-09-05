@@ -6,7 +6,6 @@ package peer
 import (
 	"context"
 	"crypto"
-	"crypto/x509"
 	"net"
 	"testing"
 	"time"
@@ -41,7 +40,7 @@ type testPeer struct {
 type rawTestPeer struct {
 	config         *Config
 	conn           net.Conn
-	cert           *x509.Certificate
+	cert           *staking.Certificate
 	nodeID         ids.NodeID
 	inboundMsgChan <-chan message.InboundMessage
 }
@@ -69,12 +68,14 @@ func makeRawTestPeers(t *testing.T, trackedSubnets set.Set[ids.ID]) (*rawTestPee
 
 	tlsCert0, err := staking.NewTLSCert()
 	require.NoError(err)
+	cert0 := staking.CertificateFromX509(tlsCert0.Leaf)
 
 	tlsCert1, err := staking.NewTLSCert()
 	require.NoError(err)
+	cert1 := staking.CertificateFromX509(tlsCert1.Leaf)
 
-	nodeID0 := ids.NodeIDFromCert(tlsCert0.Leaf)
-	nodeID1 := ids.NodeIDFromCert(tlsCert1.Leaf)
+	nodeID0 := ids.NodeIDFromCert(cert0)
+	nodeID1 := ids.NodeIDFromCert(cert1)
 
 	mc := newMessageCreator(t)
 
@@ -134,14 +135,14 @@ func makeRawTestPeers(t *testing.T, trackedSubnets set.Set[ids.ID]) (*rawTestPee
 	peer0 := &rawTestPeer{
 		config:         &peerConfig0,
 		conn:           conn0,
-		cert:           tlsCert0.Leaf,
+		cert:           cert0,
 		nodeID:         nodeID0,
 		inboundMsgChan: inboundMsgChan0,
 	}
 	peer1 := &rawTestPeer{
 		config:         &peerConfig1,
 		conn:           conn1,
-		cert:           tlsCert1.Leaf,
+		cert:           cert1,
 		nodeID:         nodeID1,
 		inboundMsgChan: inboundMsgChan1,
 	}
@@ -191,12 +192,10 @@ func makeReadyTestPeers(t *testing.T, trackedSubnets set.Set[ids.ID]) (*testPeer
 	peer0, peer1 := makeTestPeers(t, trackedSubnets)
 
 	require.NoError(peer0.AwaitReady(context.Background()))
-	isReady := peer0.Ready()
-	require.True(isReady)
+	require.True(peer0.Ready())
 
 	require.NoError(peer1.AwaitReady(context.Background()))
-	isReady = peer1.Ready()
-	require.True(isReady)
+	require.True(peer1.Ready())
 
 	return peer0, peer1
 }
@@ -218,8 +217,7 @@ func TestReady(t *testing.T) {
 		),
 	)
 
-	isReady := peer0.Ready()
-	require.False(isReady)
+	require.False(peer0.Ready())
 
 	peer1 := Start(
 		rawPeer1.config,
@@ -235,12 +233,10 @@ func TestReady(t *testing.T) {
 	)
 
 	require.NoError(peer0.AwaitReady(context.Background()))
-	isReady = peer0.Ready()
-	require.True(isReady)
+	require.True(peer0.Ready())
 
 	require.NoError(peer1.AwaitReady(context.Background()))
-	isReady = peer1.Ready()
-	require.True(isReady)
+	require.True(peer1.Ready())
 
 	peer0.StartClose()
 	require.NoError(peer0.AwaitClosed(context.Background()))
@@ -256,8 +252,7 @@ func TestSend(t *testing.T) {
 	outboundGetMsg, err := mc.Get(ids.Empty, 1, time.Second, ids.Empty, p2p.EngineType_ENGINE_TYPE_SNOWMAN)
 	require.NoError(err)
 
-	sent := peer0.Send(context.Background(), outboundGetMsg)
-	require.True(sent)
+	require.True(peer0.Send(context.Background(), outboundGetMsg))
 
 	inboundGetMsg := <-peer1.inboundMsgChan
 	require.Equal(message.GetOp, inboundGetMsg.Op())
@@ -271,8 +266,7 @@ func TestPingUptimes(t *testing.T) {
 	trackedSubnetID := ids.GenerateTestID()
 	untrackedSubnetID := ids.GenerateTestID()
 
-	trackedSubnets := set.NewSet[ids.ID](1)
-	trackedSubnets.Add(trackedSubnetID)
+	trackedSubnets := set.Of(trackedSubnetID)
 
 	mc := newMessageCreator(t)
 
@@ -391,8 +385,7 @@ func sendAndFlush(t *testing.T, sender *testPeer, receiver *testPeer) {
 	mc := newMessageCreator(t)
 	outboundGetMsg, err := mc.Get(ids.Empty, 1, time.Second, ids.Empty, p2p.EngineType_ENGINE_TYPE_SNOWMAN)
 	require.NoError(t, err)
-	sent := sender.Send(context.Background(), outboundGetMsg)
-	require.True(t, sent)
+	require.True(t, sender.Send(context.Background(), outboundGetMsg))
 	inboundGetMsg := <-receiver.inboundMsgChan
 	require.Equal(t, message.GetOp, inboundGetMsg.Op())
 }
